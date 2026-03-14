@@ -1,4 +1,4 @@
-# 🚀 AutoReturn - Unified AI Intelligence Hub
+# AutoReturn - Unified AI Intelligence Hub
 
 <div align="center">
 
