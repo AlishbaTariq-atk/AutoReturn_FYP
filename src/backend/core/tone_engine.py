@@ -42,12 +42,16 @@ class ToneDetectionResult:
 class ToneDetector:
     """Embedded deterministic tone detector used by ToneEngine."""
 
+    _shared_nlp = None
+    _shared_nlp_failed = False
+    _shared_nlp_model_name = "en_core_web_md"
+
     # -------------------------
     # INIT
     # Initializes the class instance and sets up default routing or UI states.
     # -------------------------
     def __init__(self):
-        self.nlp = spacy.load("en_core_web_md")
+        self.nlp = self._load_shared_nlp()
         self.rules = self._load_detection_rules()
         self.lexicon = self.rules.get("lexicon", {})
         self.word_sets = self.rules.get("word_sets", {})
@@ -64,11 +68,30 @@ class ToneDetector:
         self.pos_centroid, self.neg_centroid = self._compute_centroids()
         self.tone_weights = self._load_tone_weights(self.rules.get("feature_weights", {}))
 
+    @classmethod
+    def _load_shared_nlp(cls):
+        if cls._shared_nlp is not None:
+            return cls._shared_nlp
+        if cls._shared_nlp_failed:
+            return None
+
+        try:
+            cls._shared_nlp = spacy.load(cls._shared_nlp_model_name)
+            return cls._shared_nlp
+        except Exception as e:
+            print(f"ToneDetector: spaCy model '{cls._shared_nlp_model_name}' failed to load: {e}")
+            print("ToneDetector: Falling back to lexicon-only mode (no semantic embeddings).")
+            cls._shared_nlp_failed = True
+            return None
+
     # -------------------------
     # ANALYZE MESSAGE
     # Handles analyze functionality for message.
     # -------------------------
     def analyze_message(self, text: str) -> ToneDetectionResult:
+        if self.nlp is None:
+            # Fallback: lexicon-only mode without spaCy
+            return self._lexicon_only_analyze(text)
         doc = self.nlp(text)
         lemmas = [t.lemma_.lower() for t in doc if t.is_alpha]
         if not lemmas:
@@ -98,12 +121,63 @@ class ToneDetector:
         )
 
     # -------------------------
+    # LEXICON-ONLY FALLBACK
+    # Used when spaCy model is unavailable. Analyzes tone using only
+    # the word lexicon and regex patterns, without NLP embeddings.
+    # -------------------------
+    def _lexicon_only_analyze(self, text: str) -> ToneDetectionResult:
+        words = re.findall(r'\b\w+\b', text.lower())
+        if not words:
+            return self._empty_result()
+        total_score = 0.0
+        word_scores = []
+        for i, word in enumerate(words):
+            score = self.lexicon.get(word, 0.0)
+            context = words[max(0, i - 3):i]
+            if any(w in self.negations for w in context):
+                score = -score
+            if i > 0 and words[i - 1] in self.intensifiers:
+                score *= self.intensifiers[words[i - 1]]
+            word_scores.append(score)
+            total_score += score
+        normalized_score = total_score / math.sqrt(len(words) + 1)
+        normalized_score = max(-5.0, min(5.0, normalized_score))
+        formal_regex = self._regex_score(text, "formal")
+        informal_regex = self._regex_score(text, "informal")
+        formal_salutations = self._get_word_set("formal_salutations")
+        casual_greetings = self._get_word_set("casual_greetings")
+        slang_words = self._get_word_set("slang_words")
+        formal_score = (
+            self._ratio(words, formal_salutations) * 1.0 +
+            formal_regex * 1.4 - informal_regex * 1.2
+        )
+        informal_score = (
+            self._ratio(words, casual_greetings) * 1.0 +
+            self._ratio(words, slang_words) * 1.3 +
+            informal_regex * 1.5 - formal_regex * 1.0
+        )
+        tone_scores = {
+            ToneType.FORMAL: max(0.0, formal_score),
+            ToneType.INFORMAL: max(0.0, informal_score),
+        }
+        confidence = self._calculate_confidence(tone_scores)
+        detected_tone = self._select_best_tone(tone_scores, confidence)
+        tone_signal = self._derive_tone_signal(tone_scores)
+        return ToneDetectionResult(
+            detected_tone=detected_tone,
+            tone_signal=tone_signal,
+            confidence_score=confidence,
+            tone_signal_score=normalized_score,
+            tone_scores=tone_scores,
+        )
+
+    # -------------------------
     # SCORE TOKEN
     # Handles score functionality for token.
     # -------------------------
     def _score_token(self, lemma: str, index: int, lemmas: List[str]) -> float:
         score = self.lexicon.get(lemma, 0.0)
-        if score == 0.0 and self.nlp.vocab.has_vector(lemma):
+        if score == 0.0 and self.nlp is not None and self.nlp.vocab.has_vector(lemma):
             score = self._embedding_fallback(lemma)
         context = lemmas[max(0, index - 3):index]
         if any(w in self.negations for w in context):
@@ -372,6 +446,8 @@ class ToneDetector:
     # Handles compute functionality for centroids.
     # -------------------------
     def _compute_centroids(self):
+        if self.nlp is None:
+            return np.zeros(1), np.zeros(1)
         pos_words = ["excellent", "amazing", "great", "good", "love"]
         neg_words = ["terrible", "awful", "bad", "worst", "angry"]
         pos_vecs = [self.nlp.vocab.get_vector(w) for w in pos_words if self.nlp.vocab.has_vector(w)]

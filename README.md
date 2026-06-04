@@ -1,4 +1,4 @@
-# AutoReturn - Unified AI Intelligence Hub
+# 🚀 AutoReturn - Unified AI Intelligence Hub
 
 <div align="center">
 
@@ -9,7 +9,10 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Architecture](https://img.shields.io/badge/Architecture-Orchestrator--Agent-blueviolet?style=flat-square)](https://github.com/hasnainsaleem18/AutoReturn)
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-black?style=flat-square&logo=ollama&logoColor=white)](https://ollama.ai)
-
+[![AppImage](https://img.shields.io/badge/Linux-AppImage-orange?style=flat-square&logo=linux&logoColor=white)](https://appimage.org)
+[![Deb](https://img.shields.io/badge/Linux-DEB%20Package-red?style=flat-square&logo=debian&logoColor=white)](https://www.debian.org)
+[![CI](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white)](https://github.com/hasnainsaleem18/AutoReturn/actions)
+[![Voice](https://img.shields.io/badge/Voice-Whisper%20Small-green?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/whisper)
 </div>
 
 ---
@@ -22,166 +25,265 @@ This project was built from the ground up to solve the problem of *information o
 
 ---
 
+## 📦 Installation & Distribution
+
+AutoReturn ships as a fully packaged Linux desktop application. Choose the format that suits your system.
+
+### Option 1 — AppImage (Recommended, Any Linux Distro)
+
+No installation required. Download, make executable, and run.
+
+```bash
+chmod +x AutoReturn-x86_64.AppImage
+./AutoReturn-x86_64.AppImage
+```
+
+> Works on any Linux distribution. Voice control (Whisper small model) is bundled — no extra downloads needed.
+
+### Option 2 — DEB Package (Ubuntu / Debian-based)
+
+```bash
+# Install
+sudo dpkg -i autoreturn_1.0.0_amd64.deb
+
+# Run from terminal or app launcher
+autoreturn
+
+# Uninstall
+sudo dpkg -r autoreturn
+```
+
+### Option 3 — Run from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/kashan-miankhel14/AutoReturn.git
+cd AutoReturn
+
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install spaCy NLP model
+python -m spacy download en_core_web_md
+
+# Launch
+./run.sh
+```
+
+---
+
+## ⚙️ Prerequisites (All Installation Methods)
+
+Regardless of how you install AutoReturn, **Ollama must be running** for AI features to work.
+
+### 1. Install Ollama
+
+```bash
+curl -fsSL https://ollama.ai/install.sh | sh
+```
+
+### 2. Start Ollama
+
+```bash
+ollama serve
+```
+
+### 3. Pull the AI Model
+
+```bash
+ollama pull qwen3-next:80b-cloud
+```
+
+> Voice control uses OpenAI Whisper (small model) — bundled inside AppImage/DEB, no separate download needed.
+
+### 4. Configure Supabase (Authentication)
+
+Create a `.env` file at the project root (or `~/.autoreturn/.env` for packaged installs):
+
+```env
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_ANON_KEY=your-publishable-anon-key
+```
+
+> Supabase is used for user authentication only. No message data is stored in Supabase.
+
+---
+
+## 🔨 Building from Source
+
+### Build AppImage
+
+```bash
+# Install build dependency
+sudo pacman -S appimagetool-bin librsvg   # Arch/Garuda
+# or: sudo apt install appimagetool librsvg2-bin  # Ubuntu
+
+# Build
+bash appimage/build_appimage.sh
+```
+
+Output: `AutoReturn-x86_64.AppImage`
+
+### Build DEB Package
+
+```bash
+# Install dpkg tools
+sudo pacman -S dpkg   # Arch/Garuda
+# or already available on Ubuntu/Debian
+
+# Build
+bash packaging/build_deb.sh
+```
+
+Output: `autoreturn_1.0.0_amd64.deb`
+
+### Build Notes
+
+- Build artifacts (`*.AppImage`, `build_appimage/`, `build_deb/`, `*.deb`) are excluded from git
+- The spaCy `en_core_web_md` model is automatically bundled into both packages
+- Voice features are disabled in packaged builds (whisper/sounddevice not bundled)
+- All user data is stored in `~/.autoreturn/` for packaged installs (writable, persists across updates)
+
+---
+
 ## Software Architecture
 
-AutoReturn moved away from traditional monolithic design to a highly optimized **Decoupled Orchestrator-Agent Architecture**.
+AutoReturn uses a **Decoupled Orchestrator-Agent Architecture**.
 
 ### 1. The Orchestrator (`orchestrator.py`)
 
-The "Central Brain" of the application. The orchestrator receives intents layer from the UI (like "Fetch Messages" or "Generate Draft"), classifies the command, and routes it to the correct downstream agent. It holds the shared instances of the `ToneEngine` and `AiService` so that memory is not wasted.
+The "Central Brain". Receives intents from the UI, classifies commands, and routes them to the correct agent. Holds shared instances of `ToneEngine` and `AiService` to avoid memory waste.
 
 ### 2. Intelligent Agents (`gmail_agent.py`, `slack_agent.py`)
 
-These are specialized worker classes acting as bridges to remote APIs.
+Specialized workers bridging remote APIs.
 
-* They perform parallel network requests via `asyncio`.
-* They automatically pipe incoming data through the **Priority Engine**, **Tone Engine**, and **Task Classifier** before ever sending the data back to the UI.
-* This is why the UI never lags during heavy data processing.
+* Perform parallel network requests via `asyncio`
+* Pipe data through **Priority Engine**, **Tone Engine**, and **Task Classifier** before returning to UI
+* UI never lags during heavy data processing
 
 ### 3. Progressive Loading UI
 
-A revolutionary UI approach where messages are fetched from APIs instantly (<1s) and displayed on the screen immediately. Meanwhile, heavy AI tasks (like generating summaries) are "layered" on top in the background using a non-blocking queue. The user sees their inbox instantly, and the AI intelligence populates row-by-row as it finishes.
+Messages are fetched and displayed instantly (<1s). Heavy AI tasks (summaries) are layered on top in a non-blocking background queue — inbox appears immediately, AI intelligence populates row-by-row.
 
 ---
 
 ## Core Engines & Algorithms
 
-AutoReturn’s true power lies in its custom-built backend engines.
-
 ### The 4-Part Priority Algorithm (`priority_engine.py`)
 
-A fast, custom-built deterministic algorithm that scores every message from 0.0 to 10.0 and classifies it as **High**, **Medium**, or **Low** urgency. It relies on four sub-systems:
+Scores every message 0.0–10.0 → **High / Medium / Low** urgency.
 
-1. **Algorithm 01 (Master Engine)**: Uses a weighted mathematical formula `Urgency = (w1 × Keyword) + (w2 × Deadline) + (w3 × Sender)` to compute the final score.
-2. **Algorithm 02 (Keyword Engine)**: Scans for Direct Urgency, Time Pressure, and Action Calls. It uses `spaCy` NLP for semantic context checking to understand **negations** (ensuring that the phrase *"this is NOT urgent"* does not trigger a high score).
-3. **Algorithm 03 (Deadline Engine)**: Uses complex Regex matching to extract absolute dates (e.g., `12/25/2026`) and relative deadlines (e.g., `by tomorrow`). If the deadline is within 24 hours, it applies a massive point bonus.
-4. **Algorithm 04 (Sender Engine)**: Checks the sender and CC lists against a user-configurable "Priority List" (e.g., marking emails from your boss as instant 10.0s).
+1. **Algorithm 01 (Master Engine)**: `Urgency = (w1 × Keyword) + (w2 × Deadline) + (w3 × Sender)`
+2. **Algorithm 02 (Keyword Engine)**: spaCy NLP with negation detection — *"NOT urgent"* won't trigger high score
+3. **Algorithm 03 (Deadline Engine)**: Regex extracts absolute dates and relative deadlines, 24h bonus
+4. **Algorithm 04 (Sender Engine)**: User-configurable priority sender list
 
 ### AI Task Classification System
 
-Rather than just showing you a message, AutoReturn tells you *what to do with it*. Every message is passed through a keyword heuristic matrix and categorized into one of 5 actionable types:
+Every message is categorized into one of 5 actionable types:
 
-1. **File Attachment Required** — Sender is explicitly requesting a document.
-2. **Draft Generation** — The email requires a detailed, composed reply.
-3. **Auto Reply** — Transactional message requiring a simple acknowledgement.
-4. **Simple Reply Required** — Quick response or confirmation expected.
-5. ℹ**Informational** — No action needed, read-and-archive.
+1. **File Attachment Required** — Sender requesting a document
+2. **Draft Generation** — Needs a composed reply
+3. **Auto Reply** — Simple acknowledgement needed
+4. **Simple Reply Required** — Quick confirmation expected
+5. **Informational** — No action needed
 
 ### Advanced Tone Detection (`tone_engine.py`)
 
-A lightning-fast (<5ms) algorithm that analyzes the tone of incoming text.
+Lightning-fast (<5ms) hybrid tone analysis:
 
-* **Hybrid Approach**: Combines a 60+ word emotional lexicon with `spaCy` embedding similarity.
-* **9-Stage Pipeline**: Handles tokenization, scoring, normalizations, negation checking, and intensifier multiplier scaling.
-* **Accuracy**: Tested at 80% accuracy on real-world corpuses. It classifies messages as `formal`, `informal`, or `neutral` and then uses this data to **suggest the proper tone** for your AI-generated drafts.
+* 60+ word emotional lexicon + spaCy embedding similarity
+* 9-stage pipeline: tokenization → scoring → negation → intensifier scaling
+* 80% accuracy on real-world corpus
+* Graceful fallback to lexicon-only mode if spaCy model unavailable
 
 ### Event & Calendar Extractor (`event_extractor.py`)
 
-Scans message bodies for evidence of meetings, appointments, or deadlines.
-
-* Uses a base layer of Regex for speed, but seamlessly falls back to a **Local LLM extraction prompt** if the date phrasing is ambiguous or complex.
-* Returns structured JSON data representing the Event, and powers the UI feature allowing the user to **Export to .ics** and add the meeting directly to Google/Apple Calendar.
+* Regex base layer for speed
+* LLM fallback for ambiguous date phrasing
+* Exports structured `.ics` files for Google/Apple Calendar
 
 ---
 
 ## Automation & Workflow Control
 
-AutoReturn is a fully autonomous assistant when you are away from your desk.
-
 ### DND & Reply Policy Engine
 
-Controlled via the Settings menu, AutoReturn manages how incoming messages are handled:
+* **DND OFF**: Standard mode — review and send replies manually
+* **DND ON + Auto Reply OFF**: AI generates drafts silently in background, tagged "Draft Ready"
+* **DND ON + Auto Reply ON**: Full automation — sends replies automatically to allowlisted senders
 
-* **DND OFF**: Standard mode. You read messages, you click "Reply", and a Pre-Send Review Dialog appears where you can generate AI drafts naturally.
-* **DND ON + Auto Reply OFF**: The app suppresses OS desktop notifications. When messages arrive, the AI quietly generates **Drafts** in the background and tags the rows as "Draft Ready". You return to your desk and just click "Send" on the pre-written drafts.
-* **DND ON + Auto Reply ON (Allowlist Mode)**: Total automation. The app checks if the sender is on your trusted Allowlist. If they are, it generates a reply, **sends it via the API automatically**, and logs the action.
+### Attachment Resolver
 
-### Attachment Resolver & Ambiguity Handling
-
-* Reads your `file_access_paths` setting to know where it is allowed to look for files on your hard drive.
-* If a sender asks for "the Q3 report", AutoReturn searches your allowed folders, finds the file, and auto-attaches it to the draft.
-* **Ambiguity Blocking**: If it finds *two* files named "Q3 Report", it halts the automation and prompts the user to manually select the correct one, ensuring no confidential data is sent by mistake.
+* Searches user-configured `file_access_paths` for requested files
+* Ambiguity blocking — halts if multiple matching files found, prompts user to choose
 
 ---
 
-##  UI & Frontend Engineering
+## UI & Frontend
 
-Built on **PySide6 (Qt for Python)**, the UI is styled entirely with custom CSS.
+Built on **PySide6 (Qt for Python)**, styled with custom CSS.
 
-* **Unified Data Table**: A customized `QTableWidget` displays standard columns (Sender, Subject, Platform) alongside AI-enriched data (Priority Badges, Summary cell, Event Icons, Task Badges).
-* **Tone Selector Widget**: A modular, reusable UI component that allows users to override the AI's default tone (Formal vs Informal) before generating a draft.
-* **Review Dialogs**: Polished popups for both Gmail and Slack that allow users to edit AI drafts, attach files, and preview the final payload securely before it hits the API.
+* **Unified Data Table**: Priority badges, AI summaries, event icons, task badges
+* **Tone Selector Widget**: Override AI tone (Formal/Informal) before draft generation
+* **Review Dialogs**: Edit drafts, attach files, preview before sending
 
 ---
 
 ## Project Structure
 
-The AutoReturn codebase is **fully documented with inline presentation-ready comments detailing every single algorithm and class functionality**. You can open any file in `src/backend/core/` and read exactly how the math works in plain English.
-
 ```text
 AutoReturn/
-├── main.py                  # Application entry point
-├── run.sh                   # Startup shell wrapper
-├── auto_commenter.py        # Custom AST scripting tool for documentation
-├── config/                  # Settings definitions
-├── data/                    # JSON Databases (Audits, Priority Config, Tone Profiles)
+├── main.py                        # Application entry point
+├── run.sh                         # Dev launcher script
+├── requirements.txt               # Python dependencies
+├── config/                        # App configuration
+├── data/                          # JSON databases (priority rules, tone profiles)
+├── appimage/                      # AppImage build system
+│   ├── build_appimage.sh          # AppImage builder script
+│   ├── autoreturn.svg             # App icon
+│   ├── requirements-appimage.txt  # Bundled dependencies (no voice)
+│   └── build_issues/             # Documented build issues & fixes
+├── packaging/
+│   └── build_deb.sh              # DEB package builder script
 ├── src/
 │   ├── backend/
-│   │   ├── core/            # The Brain (Algorithms, Tone Engine, Event Extractor)
-│   │   ├── agents/          # Platform Interfaces (GmailAgent, SlackAgent)
-│   │   ├── services/        # AI Service, Backend APIs, Settings Coordinators
-│   │   └── models/          # Pydantic data schemas for type-safe routing
+│   │   ├── core/                  # Algorithms (Priority, Tone, Events, Drafts)
+│   │   ├── agents/                # GmailAgent, SlackAgent
+│   │   ├── services/              # AI, Gmail, Slack, Supabase, Calendar
+│   │   └── models/                # Pydantic schemas
 │   └── frontend/
-│       ├── ui/              # Main PyQt/PySide Window (autoreturn_app.py)
-│       ├── dialogs/         # Send replies, View events, App settings
-│       └── widgets/         # Pluggable modular UI elements (Tone selector)
-└── docs/                    # Technical architecture diagrams and algorithms
-```
-
----
-
-## Setup & Installation
-
-### 1. Prerequisites
-
-* **Python 3.10+** (Recommended 3.12)
-* **Ollama** (Download from [ollama.ai](https://ollama.ai))
-
-### 2. Quick Start
-
-```bash
-# Clone the repository
-git clone https://github.com/hasnainsaleem18/AutoReturn.git
-cd AutoReturn
-
-# Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install all Python dependencies
-pip install -r requirements.txt
-
-# Install the spaCy model used for Semantic NLP Context Analysis
-python -m spacy download en_core_web_md
-
-# Pull the primary AI model used by the orchestrator
-ollama pull kimi-k2.5:cloud
-
-# Authenticate with Ollama Cloud (required for cloud-backed local models)
-ollama signin
-
-# Launch the application
-./run.sh
+│       ├── ui/                    # Main window (autoreturn_app.py)
+│       ├── dialogs/               # Auth, Settings, Reply, Event dialogs
+│       └── widgets/               # Tone selector, notification widgets
+└── docs/                          # Architecture docs & algorithm writeups
 ```
 
 ---
 
 ## App Configuration
 
-All configuration is handled safely via the **Settings menu** in the UI, which writes to `data/automation_settings.json`.
+### Authentication
 
-* **Gmail Authorization**: Requires a valid Google Cloud `client_secret.json` to be placed in the project root. The app will launch an OAuth browser flow on first run.
-* **Slack Authorization**: Requires a valid Slack App User Token (`xoxp-...`) with `history` and `read` scopes, pasted into the Settings menu.
+Supabase email/password auth. Add to `.env`:
+
+```env
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_ANON_KEY=your-publishable-key
+```
+
+Google OAuth login is also supported independently.
+
+### Integrations
+
+* **Gmail**: Upload `client_secret.json` via Settings → run OAuth flow → `token.json` auto-generated
+* **Slack**: Paste `xoxp-...` User OAuth Token in Settings (requires `history` + `read` scopes)
+* **Per-user scoping**: Each AutoReturn account has its own Gmail/Slack connection
 
 ---
 
@@ -202,10 +304,13 @@ All configuration is handled safely via the **Settings menu** in the UI, which w
 * [x] Sub-thread Gmail Auto-reply Matching
 * [x] Secure File Attachment Context Resolver
 * [x] Fully Documented Codebase (Presentation-Ready)
+* [x] **AppImage Package (Linux universal)**
+* [x] **DEB Package (Ubuntu/Debian)**
 * [ ] Universal Smart Draft generation expansion
 * [ ] Multi-language Support Integration
 
 ---
+
 <div align="center">
 <b>Built as a Final Year Project at NUCES FAST Peshawar</b><br>
 <i>Developed by Kashan Saeed, Alishba Tariq & Hasnain Saleem</i>

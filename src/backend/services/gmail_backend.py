@@ -63,6 +63,17 @@ class GmailIntegrationService(QObject):
         self._api_lock = threading.Lock()
 
     # -------------------------
+    # SET DATA DIR
+    # Switches local Gmail credential storage to a new directory.
+    # -------------------------
+    def set_data_dir(self, data_dir: str):
+        self.disconnect()
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.client_secret_path = os.path.join(self.data_dir, "client_secret.json")
+        self.token_path = os.path.join(self.data_dir, "token.json")
+
+    # -------------------------
     # AUTHENTICATION METHODS
     # -------------------------
     def configure_client_secret(self, source_path: str) -> str:
@@ -292,6 +303,35 @@ class GmailIntegrationService(QObject):
                     references=references,
                 )
             return True, "Reply sent successfully."
+        except Exception as exc:
+            message = str(exc)
+            self.error_occurred.emit(message)
+            return False, message
+
+    def send_new_email(self, to_email: str, subject: str, body: str, attachments: list = None) -> tuple[bool, str]:
+        """Send a new Gmail message that is not tied to an existing thread."""
+        if not self.gmail_api:
+            message = "Connect to Gmail before sending."
+            self.error_occurred.emit(message)
+            return False, message
+
+        to_email = (to_email or "").strip()
+        if not to_email:
+            message = "Missing recipient email address."
+            self.error_occurred.emit(message)
+            return False, message
+
+        try:
+            with self._api_lock:
+                result = self.gmail_api.send_email(
+                    to_email,
+                    subject or "Message from AutoReturn",
+                    body,
+                    attachments=attachments or [],
+                )
+            if not result:
+                return False, "Gmail send failed."
+            return True, "Email sent successfully."
         except Exception as exc:
             message = str(exc)
             self.error_occurred.emit(message)

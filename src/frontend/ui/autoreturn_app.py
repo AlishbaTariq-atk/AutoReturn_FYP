@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union, Tuple
 
@@ -22,7 +23,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QCheckBox, QSizePolicy, QMessageBox, QDialog, QTextEdit,
-    QFileDialog, QApplication, QStyle, QSizePolicy, QSpacerItem, QComboBox, QInputDialog
+    QFileDialog, QApplication, QStyle, QSizePolicy, QSpacerItem, QComboBox, QInputDialog,
+    QAbstractItemView
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal, Slot, QObject, QEvent, QUrl
 from PySide6.QtGui import (QColor, QIcon, QPixmap, QFont, QFontMetrics, 
@@ -57,11 +59,20 @@ from src.backend.services.ai_service import (
     SummaryGeneratorThread,
     QueueSummaryGenerator
 )
+from src.backend.services.voice_service import VoiceCommand, VoiceCommandParser, VoiceService
+from src.backend.services.voice_intent_service import VoiceIntent, VoiceIntentService
+from src.backend.services.supabase_auth_service import SupabaseAuthService
 
 import asyncio
 from src.backend.services.gmail_backend import GmailIntegrationService
 from src.backend.models.agent_models import AgentRequest, AgentResponse, Intent
+from src.backend.models.automation_models import VoiceSettings
 from src.backend.core.attachment_resolver import AttachmentResolver
+from src.backend.utils.desktop_notifications import notify_desktop
+from src.backend.utils.message_analysis_cache import (
+    ANALYSIS_CACHE_FIELDS,
+    build_message_analysis_cache,
+)
 
 
 # -------------------------
@@ -115,6 +126,17 @@ class AutoReturnApp(QMainWindow):
     This class serves as the primary interface for the AutoReturn application,
     integrating email and messaging services with a unified inbox view.
     """
+
+    GMAIL_POLL_INTERVAL_MS = 30000
+    STARTUP_SLACK_CONNECT_DELAY_MS = 100
+    STARTUP_GMAIL_CONNECT_DELAY_MS = 220
+    STARTUP_GMAIL_INITIAL_SYNC_DELAY_MS = 450
+    STARTUP_GMAIL_BACKFILL_DELAY_MS = 2200
+    STARTUP_SLACK_INITIAL_FETCH_LIMIT = 200
+    STARTUP_GMAIL_INITIAL_FETCH_LIMIT = 10
+    AUTO_SYNC_GMAIL_FETCH_LIMIT = 10
+    SLACK_LISTENER_INTERVAL_SECONDS = 4
+    VOICE_DIRECT_SEND_CANCEL_SECONDS = 4
     
     # -------------------------
     # INITIALIZATION
@@ -131,7 +153,7 @@ class AutoReturnApp(QMainWindow):
         from src.backend.core.orchestrator import Orchestrator
         
         # Initialize orchestrator (the brain that coordinates everything)
-        self.orchestrator = Orchestrator(ollama_model="gpt-oss:120b-cloud")
+        self.orchestrator = Orchestrator()
         
         # Get agents from orchestrator (not direct services)
         self.gmail_agent = self.orchestrator.get_agent("gmail")
@@ -144,6 +166,8 @@ class AutoReturnApp(QMainWindow):
         self.ollama_service = self.orchestrator.ai_service
         self.calendar_service = CalendarService(self._get_gmail_data_dir())
         self.ics_output_dir = self._get_ics_output_dir()
+        self.supabase_auth_service = SupabaseAuthService()
+        self.connected_accounts_map = {}
         
         # Slack listener
         self.slack_listener = None
@@ -158,6 +182,7 @@ class AutoReturnApp(QMainWindow):
         # and crashing the entire server with Exit Code 137 when processing large bursts.
         self.queue_summary_generator = QueueSummaryGenerator(self.ollama_service, max_concurrent=1)
         self.queue_summary_generator.summary_generated.connect(self.on_summary_generated)
+        self.queue_summary_generator.error_occurred.connect(self.on_summary_error)
         self.queue_summary_generator.progress_update.connect(self.on_summary_progress)
         self.queue_summary_generator.batch_complete.connect(self.on_batch_summary_complete)
         self.summary_threads = {}  # Track active summary generation threads
@@ -172,6 +197,7 @@ class AutoReturnApp(QMainWindow):
         self.automation_auto_reply_pending_ids = set()
         self.attachment_resolver = AttachmentResolver()
         self.selected_message_keys = set()
+        self._last_context_message_key = None
         self.current_page = 1
         self.rows_per_page = 15
         self.rows_per_page_options = [10, 15, 25, 50]
@@ -185,21 +211,28 @@ class AutoReturnApp(QMainWindow):
         self.expanded_row = None
         self.search_query = ""
         self.search_filters = None
+        self.voice_service = None
+        self.voice_settings = None
+        self.voice_intent_service = VoiceIntentService(self.orchestrator.ai_service)
+        self._voice_service_init_attempted = False
+        self._voice_button_hint = "Hold CTRL+SHIFT+V to speak a command."
+        self._voice_permission_dialog_visible = False
+        self.voice_command_history = []
+        self._voice_resolution_cancelled = False
+        self._startup_tasks_scheduled = False
+        self._startup_gmail_backfill_scheduled = False
         
         self.setup_ui()
         self.setStyleSheet(get_stylesheet())
+        QTimer.singleShot(0, self._init_voice_service)
         
         self.time_refresh_timer = QTimer()
         self.time_refresh_timer.timeout.connect(self.refresh_message_times)
-        self.time_refresh_timer.start(60000)
         
         self.gmail_refresh_timer = QTimer()
         self.gmail_refresh_timer.timeout.connect(self.auto_sync_gmail)
-        # Check every 15 seconds for near real-time Gmail updates
-        self.gmail_refresh_timer.start(15000)
         
-        self._try_auto_connect_slack()
-        self._try_auto_connect_gmail()
+        QTimer.singleShot(0, self._schedule_startup_tasks)
     
 
 
@@ -224,14 +257,28 @@ class AutoReturnApp(QMainWindow):
     # -------------------------
     def _try_auto_connect_slack(self):
         """Attempt to automatically connect to Slack using stored credentials."""
+        if not self._is_provider_enabled_for_current_user("slack"):
+            return
         try:
             import keyring
-            token = keyring.get_password("autoreturn", "slack_token")
+            token = keyring.get_password("autoreturn", self._slack_keyring_key())
             if token:
                 print("Auto-connecting to Slack...")
                 self.connect_slack(token)
         except:
             pass
+
+    def _schedule_startup_tasks(self):
+        """Stagger startup work so the window appears before background services sync."""
+        if self._startup_tasks_scheduled:
+            return
+        self._startup_tasks_scheduled = True
+
+        self.time_refresh_timer.start(60000)
+        self.gmail_refresh_timer.start(self.GMAIL_POLL_INTERVAL_MS)
+
+        QTimer.singleShot(self.STARTUP_SLACK_CONNECT_DELAY_MS, self._try_auto_connect_slack)
+        QTimer.singleShot(self.STARTUP_GMAIL_CONNECT_DELAY_MS, self._try_auto_connect_gmail)
 
     # -------------------------
     # HELPER METHODS
@@ -245,9 +292,17 @@ class AutoReturnApp(QMainWindow):
         Returns:
             str: Path to the Gmail data directory
         """
-        # Use the data directory at the project root
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-        base_dir = os.path.join(project_root, "data", "gmail_data")
+        # In AppImage, use writable home directory instead of read-only AppDir
+        if os.environ.get('APPIMAGE'):
+            base_root = os.path.join(os.path.expanduser('~'), '.autoreturn')
+        else:
+            base_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
+        user_id = self._current_user_storage_key()
+        if user_id:
+            base_dir = os.path.join(base_root, "data", "users", user_id, "gmail")
+        else:
+            base_dir = os.path.join(base_root, "data", "gmail_data")
         try:
             os.makedirs(base_dir, exist_ok=True)
         except Exception as exc:
@@ -260,8 +315,11 @@ class AutoReturnApp(QMainWindow):
     # -------------------------
     def _get_ics_output_dir(self):
         """Get directory for ICS exports."""
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-        output_dir = os.path.join(project_root, "data", "ics_exports")
+        if os.environ.get('APPIMAGE'):
+            base_root = os.path.join(os.path.expanduser('~'), '.autoreturn')
+        else:
+            base_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+        output_dir = os.path.join(base_root, "data", "ics_exports")
         try:
             os.makedirs(output_dir, exist_ok=True)
         except Exception as exc:
@@ -282,11 +340,30 @@ class AutoReturnApp(QMainWindow):
     # -------------------------
     def _try_auto_connect_gmail(self):
         """Attempt to automatically connect to Gmail using stored credentials."""
+        if not self._is_provider_enabled_for_current_user("gmail"):
+            return
         if self.gmail_service.has_token():
             success, message = self.gmail_service.connect(allow_flow=False)
             print(f"Gmail: {message}")
             if success:
-                self.handle_gmail_sync(quiet=True)
+                QTimer.singleShot(
+                    self.STARTUP_GMAIL_INITIAL_SYNC_DELAY_MS,
+                    lambda: self.handle_gmail_sync(
+                        quiet=True,
+                        max_results=self.STARTUP_GMAIL_INITIAL_FETCH_LIMIT,
+                    ),
+                )
+                self._schedule_startup_gmail_backfill()
+
+    def _schedule_startup_gmail_backfill(self):
+        """Run a fuller Gmail sync shortly after the fast startup fetch completes."""
+        if self._startup_gmail_backfill_scheduled:
+            return
+        self._startup_gmail_backfill_scheduled = True
+        QTimer.singleShot(
+            self.STARTUP_GMAIL_BACKFILL_DELAY_MS,
+            lambda: self.handle_gmail_sync(quiet=True, max_results=25),
+        )
     
     # -------------------------
     # USER MANAGEMENT
@@ -297,12 +374,27 @@ class AutoReturnApp(QMainWindow):
         Args:
             user_data (dict): Dictionary containing user information
         """
-        self.user_data = user_data
+        self.user_data = dict(user_data or {})
+        try:
+            self.supabase_auth_service.set_session_tokens(
+                self.user_data.get("access_token", ""),
+                self.user_data.get("refresh_token", ""),
+            )
+        except Exception as exc:
+            print(f"Could not restore Supabase session in app: {exc}")
+        self.connected_accounts_map = self._load_connected_accounts_for_user()
+        self.gmail_service.set_data_dir(self._get_gmail_data_dir())
         if 'connected_accounts' not in self.user_data:
             self.user_data['connected_accounts'] = {
                 'gmail': False,
                 'slack': False
             }
+
+        for provider in ('gmail', 'slack'):
+            if provider in self.connected_accounts_map:
+                self.user_data['connected_accounts'][provider] = bool(
+                    self.connected_accounts_map[provider].get('connected', False)
+                )
 
         if self.slack_service.is_connected:
             self.user_data['connected_accounts']['slack'] = True
@@ -329,13 +421,14 @@ class AutoReturnApp(QMainWindow):
                 if 'connected_accounts' not in self.user_data:
                     self.user_data['connected_accounts'] = {}
                 self.user_data['connected_accounts']['slack'] = True
+            self._save_connected_account_state(
+                provider="slack",
+                provider_account_id=self.slack_service.my_user_id or "",
+                provider_display_name=self.slack_service.my_user_name or "",
+            )
             
             self.start_slack_listener()
-            
-            print("Fetching initial messages...")
-            initial_messages = self.slack_service.sync_all_messages(limit=200)
-            if initial_messages:
-                self.on_slack_new_messages(initial_messages)
+            self._start_initial_slack_sync(limit=self.STARTUP_SLACK_INITIAL_FETCH_LIMIT)
             
             self.notifications.append({
                 'message': f"Connected to Slack: {message}",
@@ -347,6 +440,36 @@ class AutoReturnApp(QMainWindow):
             unread_count = sum(1 for n in self.notifications if not n.get('read', False))
             if hasattr(self, 'notif_badge'):
                 self.notif_badge.setText(str(unread_count))
+
+    def _start_initial_slack_sync(self, limit: int = 200):
+        """Fetch initial Slack history in the background to avoid blocking the UI thread."""
+        if not self.slack_service or not self.slack_service.is_connected:
+            return
+
+        request = AgentRequest(
+            intent=Intent.FETCH_MESSAGES,
+            parameters={
+                "limit": limit,
+                "add_ai_analysis": True,
+                "analysis_cache": self._analysis_cache_for_source("slack"),
+            },
+        )
+        worker = AgentWorker(self.orchestrator.route_request("slack", request))
+        worker.result_ready.connect(self._on_initial_slack_sync_complete)
+        worker.error_occurred.connect(self.on_agent_error)
+        worker.finished.connect(lambda: self._cleanup_worker(worker))
+        self.active_workers.append(worker)
+        worker.start()
+
+    def _on_initial_slack_sync_complete(self, response: AgentResponse):
+        """Apply the first Slack history batch once the background fetch completes."""
+        if not response.success:
+            self.on_agent_error(response.error or "Slack sync failed")
+            return
+
+        messages = response.data.get("messages", []) if response.data else []
+        if messages:
+            self.on_slack_new_messages(messages)
     
     # -------------------------
     # NORMALIZE PRIORITY
@@ -863,26 +986,38 @@ class AutoReturnApp(QMainWindow):
 
         print(f"Processing {len(new_messages)} new messages")
 
+        # Filter out duplicates before running enrichment. Existing messages keep
+        # their previous priority/tasks/events so we do not pay that cost twice.
+        existing_by_id = {msg.get('id'): msg for msg in self.messages if msg.get('id')}
+        unique_new_messages = []
+        updated_existing = False
+        for msg in new_messages:
+            msg_id = msg.get('id')
+            existing = existing_by_id.get(msg_id)
+            if existing:
+                updated_existing = self._merge_analysis_fields(existing, msg) or updated_existing
+                continue
+            unique_new_messages.append(msg)
+        
+        if not unique_new_messages:
+            if updated_existing:
+                self._schedule_table_refresh()
+            return
+
         # Run priority classification on messages that don't have it yet
         if hasattr(self, 'orchestrator') and hasattr(self.orchestrator, 'agents'):
             slack_agent = self.orchestrator.agents.get('slack')
             if slack_agent and hasattr(slack_agent, 'priority_engine'):
-                for msg in new_messages:
-                    if not msg.get('priority') or msg.get('priority') == 'normal':
+                for msg in unique_new_messages:
+                    if not str(msg.get('ai_priority_score', '') or '').strip():
                         msg['priority'] = slack_agent.priority_engine.calculate_priority(msg)
+                        msg['ai_priority_score'] = msg['priority']
                     # Normalize priority so urgent -> High etc.
                     msg['priority'] = self._normalize_priority(msg.get('priority', 'Low'))
                     # Classify task if not already done
                     if not msg.get('ai_tasks') and hasattr(slack_agent, '_classify_task'):
                         msg['ai_tasks'] = slack_agent._classify_task(msg)
-            self._enrich_slack_messages_with_schedule(new_messages)
-
-        # Filter out duplicates
-        existing_ids = {msg.get('id') for msg in self.messages}
-        unique_new_messages = [m for m in new_messages if m.get('id') not in existing_ids]
-        
-        if not unique_new_messages:
-            return
+            self._enrich_slack_messages_with_schedule(unique_new_messages)
 
         policy_groups = self._apply_automation_policy(unique_new_messages)
         draft_candidates = policy_groups.get("draft_candidates", [])
@@ -894,11 +1029,11 @@ class AutoReturnApp(QMainWindow):
         self._schedule_table_refresh()
         
         # Generate AI summaries strictly for new messages that don't already have one
-        needs_summary_items = [msg for msg in new_messages if not self._summary_for_table(msg)]
+        needs_summary_items = [msg for msg in unique_new_messages if not self._summary_for_table(msg)]
         if needs_summary_items:
             self.generate_summaries_for_messages(needs_summary_items)
         
-        for msg in new_messages:
+        for msg in unique_new_messages:
             sender = msg.get('sender', 'Unknown')
             preview = msg.get('preview', '')[:50]
             time = msg.get('time', 'just now')
@@ -987,9 +1122,53 @@ class AutoReturnApp(QMainWindow):
             message (str): Status message
         """
         if success:
+            last_sent = self.slack_service.last_sent_message() if self.slack_service else {}
+            if last_sent and last_sent.get("undo_supported"):
+                dialog = QMessageBox(self)
+                dialog.setIcon(QMessageBox.Information)
+                dialog.setWindowTitle("Message Sent")
+                dialog.setText(message)
+                dialog.setInformativeText("Slack supports deleting this sent message if you undo now.")
+                undo_button = dialog.addButton("Undo Send", QMessageBox.ActionRole)
+                dialog.addButton(QMessageBox.Ok)
+                dialog.exec()
+                if dialog.clickedButton() == undo_button:
+                    self._undo_slack_send(last_sent)
+                return
             QMessageBox.information(self, "Message Sent", message)
         else:
             QMessageBox.warning(self, "Send Failed", message)
+
+    def _undo_last_supported_send(self):
+        last_sent = self.slack_service.last_sent_message() if self.slack_service else {}
+        if last_sent and last_sent.get("undo_supported"):
+            self._undo_slack_send(last_sent)
+            return
+        self.show_status_message("No undoable Slack send is available.")
+        QMessageBox.information(
+            self,
+            "Undo Send",
+            "No undoable Slack send is available. Gmail API sends cannot be undone after delivery.",
+        )
+
+    def _undo_slack_send(self, sent_message: dict):
+        channel_id = sent_message.get("channel_id", "")
+        ts = sent_message.get("ts", "")
+        ok, result_message = self.slack_service.delete_message(channel_id, ts)
+        if ok:
+            self.show_status_message("Slack send undone.")
+            self._log_voice_event(
+                "undo_send",
+                {
+                    "source": "slack",
+                    "channel_id": channel_id,
+                    "ts": ts,
+                    "recipient_id": sent_message.get("user_id", ""),
+                },
+            )
+            QMessageBox.information(self, "Undo Send", result_message)
+        else:
+            QMessageBox.warning(self, "Undo Send Failed", result_message)
     
     # -------------------------
     # ON SLACK USERS LOADED
@@ -1026,11 +1205,14 @@ class AutoReturnApp(QMainWindow):
         if self.slack_listener:
             self.slack_listener.stop()
         
-        self.slack_listener = SlackMessageListener(self.slack_service, poll_interval=5)
+        self.slack_listener = SlackMessageListener(
+            self.slack_service,
+            poll_interval=self.SLACK_LISTENER_INTERVAL_SECONDS,
+        )
         self.slack_listener.new_messages.connect(self.on_slack_new_messages)
         self.slack_listener.error_occurred.connect(self.on_slack_error)
         self.slack_listener.start()
-        print("Slack listener started (5s interval)")
+        print(f"Slack listener started ({self.SLACK_LISTENER_INTERVAL_SECONDS}s interval)")
 
     # -------------------------
     # STOP SLACK LISTENER
@@ -1057,9 +1239,14 @@ class AutoReturnApp(QMainWindow):
         if success:
             try:
                 import keyring
-                keyring.set_password("autoreturn", "slack_token", user_token)
+                keyring.set_password("autoreturn", self._slack_keyring_key(), user_token)
             except:
                 pass
+            self._save_connected_account_state(
+                provider="slack",
+                provider_account_id=self.slack_service.my_user_id or "",
+                provider_display_name=self.slack_service.my_user_name or "",
+            )
         
         return success
     
@@ -1073,13 +1260,14 @@ class AutoReturnApp(QMainWindow):
         self.slack_service.disconnect()
         
         self.messages = [msg for msg in self.messages if msg.get('source') != 'slack']
-        self.populate_table()
+        self._schedule_table_refresh()
         
         try:
             import keyring
-            keyring.delete_password("autoreturn", "slack_token")
+            keyring.delete_password("autoreturn", self._slack_keyring_key())
         except:
             pass
+        self._mark_connected_account_disconnected("slack")
     
     # -------------------------
     # SYNC ALL MESSAGES
@@ -1102,7 +1290,12 @@ class AutoReturnApp(QMainWindow):
         
         # We can use a natural language command or direct routing
         # For simplicity in code, let's use the natural language entry point
-        worker = AgentWorker(self.orchestrator.process_user_command("sync all messages"))
+        worker = AgentWorker(
+            self.orchestrator.process_user_command(
+                "sync all messages",
+                context={"analysis_cache_by_source": self._analysis_cache_by_source()},
+            )
+        )
         worker.result_ready.connect(self.on_all_sync_complete)
         worker.error_occurred.connect(self.on_agent_error)
         worker.finished.connect(lambda: self._cleanup_worker(worker))
@@ -1172,15 +1365,28 @@ class AutoReturnApp(QMainWindow):
     def generate_all_summaries(self):
         """Manually trigger summary generation for all messages."""
         """Manually trigger summary generation for all messages"""
+        model_name = self.ollama_service.model_name
         if not self.ollama_service.check_connection():
             QMessageBox.warning(
-                self, 
-                "Ollama Not Running", 
+                self,
+                "Ollama Not Running",
                 "Ollama is not running or not accessible.\n\n"
-                "Please make sure Olloma is running:\n"
+                "Please make sure Ollama is running with the local model:\n"
                 "1. Open terminal\n"
-                "2. Run: olloma serve\n\n"
-                "Or check if it's already running in the background."
+                "2. Run: ollama serve\n"
+                "3. Confirm the model exists: ollama list\n\n"
+                f"Expected model: {model_name}"
+            )
+            return
+
+        if not self.ollama_service.check_model_available():
+            QMessageBox.warning(
+                self,
+                "Ollama Model Missing",
+                "Ollama is running, but AutoReturn cannot find the configured model.\n\n"
+                f"Expected model: {model_name}\n\n"
+                "Run this in terminal:\n"
+                f"ollama pull {model_name}"
             )
             return
         
@@ -1384,9 +1590,10 @@ class AutoReturnApp(QMainWindow):
                         if decision != "send":
                             return
 
-                    self.slack_service.send_dm_by_id(selected_user['id'], message_with_tone, attachments=attachments)
-                    QMessageBox.information(self, "Message Sent", 
-                        f"Message sent with {selected_tone.value if selected_tone else 'Default'} tone!")
+                    if self.slack_service.send_dm_by_id(selected_user['id'], message_with_tone, attachments=attachments):
+                        self.show_status_message(
+                            f"Slack message sent with {selected_tone.value if selected_tone else 'Default'} tone."
+                        )
         
         elif source == 'gmail':
             if not self.gmail_service.is_connected:
@@ -1394,6 +1601,7 @@ class AutoReturnApp(QMainWindow):
                 return
             to_email = message_data.get('email', '')
             subject = message_data.get('subject', '(No Subject)')
+            is_new_message = bool(message_data.get("_gmail_new_message"))
             # Use Gmail reply dialog with tone controls.
             dialog = SendGmailReplyDialog(
                 to_email=to_email, 
@@ -1442,11 +1650,23 @@ class AutoReturnApp(QMainWindow):
                         if decision != "send":
                             return
 
-                    success, msg = self.gmail_service.reply_to_message(message_data, reply_with_tone, attachments=attachments)
+                    if is_new_message:
+                        success, msg = self.gmail_service.send_new_email(
+                            to_email,
+                            subject or "Message from AutoReturn",
+                            reply_with_tone,
+                            attachments=attachments,
+                        )
+                    else:
+                        success, msg = self.gmail_service.reply_to_message(message_data, reply_with_tone, attachments=attachments)
                     
                     # Show applied tone in send confirmation.
-                    QMessageBox.information(self, "Reply Sent", 
-                        f"Reply sent with {selected_tone.value if selected_tone else 'Default'} tone!")
+                    if success:
+                        title = "Email Sent" if is_new_message else "Reply Sent"
+                        QMessageBox.information(self, title, 
+                            f"Message sent with {selected_tone.value if selected_tone else 'Default'} tone!")
+                    else:
+                        QMessageBox.warning(self, "Send Failed", msg or "Gmail send failed.")
         else:
             QMessageBox.warning(self, "Unknown Source", f"Cannot send to: {source}")
 
@@ -1498,6 +1718,13 @@ class AutoReturnApp(QMainWindow):
                 existing_analysis = (existing.get('ai_analysis') or "").strip()
                 if not incoming_analysis and existing_analysis:
                     incoming.pop('ai_analysis', None)
+
+                # If this sync did not run full priority analysis, keep the
+                # previous algorithmic priority instead of replacing it with
+                # GmailBackend's lightweight normal/high/urgent guess.
+                if existing.get('ai_priority_score') and not incoming.get('ai_priority_score'):
+                    incoming.pop('priority', None)
+                    incoming.pop('ai_priority_score', None)
 
                 existing.update(incoming)
                 if not self._summary_for_table(existing):
@@ -1587,13 +1814,18 @@ class AutoReturnApp(QMainWindow):
         """Initiate the Gmail OAuth authorization flow."""
         success, message = self.gmail_service.connect(allow_flow=True)
         if success:
-            self.handle_gmail_sync(quiet=True)
+            self._save_connected_account_state(
+                provider="gmail",
+                provider_account_email=self.user_data.get("email", "") if self.user_data else "",
+                provider_display_name=self.user_data.get("name", "") if self.user_data else "",
+            )
+            self.handle_gmail_sync(quiet=True, max_results=self.STARTUP_GMAIL_INITIAL_FETCH_LIMIT)
         return success, message
 
     # -------------------------
     # GMAIL INTEGRATION - MESSAGE SYNCHRONIZATION
     # -------------------------
-    def handle_gmail_sync(self, quiet: bool = False):
+    def handle_gmail_sync(self, quiet: bool = False, max_results: int = 25, add_ai_analysis: bool = True):
         """Synchronize messages from Gmail using the intelligent agent."""
         if not self.gmail_service.is_connected:
             if not quiet:
@@ -1614,7 +1846,11 @@ class AutoReturnApp(QMainWindow):
         # Create request for the agent
         request = AgentRequest(
             intent=Intent.FETCH_MESSAGES, 
-            parameters={"max_results": 25, "add_ai_analysis": True}
+            parameters={
+                "max_results": max_results,
+                "add_ai_analysis": add_ai_analysis,
+                "analysis_cache": self._analysis_cache_for_source("gmail"),
+            }
         )
         
         # Use AgentWorker to run the async request
@@ -1881,12 +2117,22 @@ class AutoReturnApp(QMainWindow):
         """
         """Generate AI summaries for a list of messages"""
         if not self.ollama_service.check_connection():
-            print("Ollama is not running. Summaries will not be generated.")
+            message = "Ollama is not running. Summaries will not be generated."
+            print(message)
+            self.show_status_message(message)
+            return
+
+        if not self.ollama_service.check_model_available():
+            message = f"Ollama model {self.ollama_service.model_name} is missing. Summaries will not be generated."
+            print(message)
+            self.show_status_message(message)
             return
         
         # Add messages to the queue processor
         # This handles concurrency and rate limiting automatically
-        self.queue_summary_generator.add_to_queue(messages)
+        queued_count = self.queue_summary_generator.add_to_queue(messages)
+        if queued_count:
+            self.show_status_message(f"Queued {queued_count} messages for AI summaries.")
     
     # -------------------------
     # AI SUMMARY GENERATION - EVENT HANDLERS
@@ -1956,6 +2202,7 @@ class AutoReturnApp(QMainWindow):
         """
         """Handle summary generation error"""
         print(f"Error generating summary for {message_id[:8]}: {error}")
+        self.show_status_message(f"AI summary failed: {error}")
         
         # Clean up thread
         if message_id in self.summary_threads:
@@ -1974,6 +2221,8 @@ class AutoReturnApp(QMainWindow):
         """
         """Handle batch summary progress updates"""
         print(f"Summary progress: {current}/{total}")
+        if total:
+            self.show_status_message(f"AI summaries: {current}/{total} processed.")
     
     # -------------------------
     # ON BATCH SUMMARY COMPLETE
@@ -1986,8 +2235,10 @@ class AutoReturnApp(QMainWindow):
             count (int): Number of summaries generated
         """
         """Handle batch summary completion"""
-        print(f"Batch summary complete: {count} summaries generated")
-        self.populate_table()
+        print(f"Batch summary complete: {count} summaries processed")
+        if count:
+            self.show_status_message(f"AI summaries complete: {count} processed.")
+        self._schedule_table_refresh()
     
     # -------------------------
     # UI UPDATES
@@ -2000,9 +2251,7 @@ class AutoReturnApp(QMainWindow):
                 msg['time'] = format_message_time(msg['datetime'])
         
         if self.table.isVisible() and self.expanded_row is None:
-            current_scroll = self.table.verticalScrollBar().value()
-            self.populate_table()
-            self.table.verticalScrollBar().setValue(current_scroll)
+            self._schedule_table_refresh(delay_ms=120)
     
     # -------------------------
     # AUTO SYNC GMAIL
@@ -2011,7 +2260,11 @@ class AutoReturnApp(QMainWindow):
     def auto_sync_gmail(self):
         """Periodically synchronize Gmail messages."""
         if self.gmail_service.is_connected:
-            self.handle_gmail_sync(quiet=True)
+            self.handle_gmail_sync(
+                quiet=True,
+                max_results=self.AUTO_SYNC_GMAIL_FETCH_LIMIT,
+                add_ai_analysis=True,
+            )
     
     # -------------------------
     # NOTIFICATION HANDLING
@@ -2024,7 +2277,1004 @@ class AutoReturnApp(QMainWindow):
         unread_count = sum(1 for n in self.notifications if not n.get('read', False))
         if hasattr(self, 'notif_badge'):
             self.notif_badge.setText(str(unread_count))
-    
+
+    # -------------------------
+    # VOICE CONTROL
+    # -------------------------
+    def _load_voice_settings(self):
+        """Load persisted voice settings from the automation coordinator."""
+        try:
+            if self.orchestrator and hasattr(self.orchestrator, "get_automation_coordinator"):
+                return self.orchestrator.get_automation_coordinator().get_settings().voice
+        except Exception as exc:
+            print(f"Error loading voice settings: {exc}")
+        return VoiceSettings()
+
+    def _init_voice_service(self):
+        """Initialize push-to-talk voice service after the UI is built."""
+        if self._voice_service_init_attempted:
+            return
+        self._voice_service_init_attempted = True
+
+        self._refresh_voice_service(self._load_voice_settings(), announce=False)
+
+    def _connect_voice_service_signals(self):
+        self.voice_service.command_ready.connect(self.on_voice_command)
+        self.voice_service.listening_started.connect(self._on_voice_listening_started)
+        self.voice_service.listening_stopped.connect(self._on_voice_listening_stopped)
+        self.voice_service.transcription_done.connect(self._on_voice_transcription_done)
+        self.voice_service.error_occurred.connect(self._on_voice_error)
+
+    def _disconnect_voice_service_signals(self, service):
+        signal_pairs = (
+            (service.command_ready, self.on_voice_command),
+            (service.listening_started, self._on_voice_listening_started),
+            (service.listening_stopped, self._on_voice_listening_stopped),
+            (service.transcription_done, self._on_voice_transcription_done),
+            (service.error_occurred, self._on_voice_error),
+        )
+        for signal, slot in signal_pairs:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _stop_voice_service(self):
+        if self.voice_service is None:
+            return
+
+        service = self.voice_service
+        self.voice_service = None
+        self._disconnect_voice_service_signals(service)
+        try:
+            service.stop()
+        except Exception as exc:
+            print(f"Error stopping voice service: {exc}")
+        service.deleteLater()
+
+    def _refresh_voice_service(self, voice_settings: VoiceSettings = None, announce: bool = True):
+        """Apply saved voice settings immediately without requiring an app restart."""
+        self._stop_voice_service()
+        self.voice_settings = voice_settings or self._load_voice_settings()
+        if not getattr(self.voice_settings, "enabled", True):
+            self._update_voice_button_state(
+                "disabled",
+                "Voice control is disabled in Settings. Enable it to use Mic.",
+            )
+            if announce:
+                self.show_status_message("Voice control disabled.")
+            return
+
+        self.voice_service = VoiceService(
+            hotkey=self.voice_settings.hotkey,
+            activation_mode=self.voice_settings.activation_mode.value,
+            language=self.voice_settings.language,
+        )
+        self._connect_voice_service_signals()
+
+        if self.voice_service.start():
+            self._update_voice_button_state(
+                "idle",
+                self.voice_service.usage_hint(),
+            )
+            if announce:
+                self.show_status_message("Voice control updated.")
+        else:
+            error = self.voice_service.startup_error() or "Voice control is unavailable on this machine."
+            self._update_voice_button_state(
+                "disabled",
+                error,
+            )
+            if announce:
+                self.show_status_message(error)
+
+    def on_automation_settings_updated(self, settings):
+        """Apply saved automation settings that affect live UI services."""
+        voice_settings = getattr(settings, "voice", None)
+        self._refresh_voice_service(voice_settings, announce=True)
+        self._update_auto_reply_status_chip()
+
+    def _update_voice_button_state(self, state: str, tooltip: str = None):
+        """Refresh mic button styling and help text."""
+        label_map = {
+            "idle": "Mic",
+            "listening": "Rec",
+            "processing": "...",
+            "disabled": "Mic",
+        }
+        if tooltip is not None:
+            self._voice_button_hint = tooltip
+
+        if not hasattr(self, "voice_btn") or self.voice_btn is None:
+            return
+
+        self.voice_btn.setText(label_map.get(state, "Mic"))
+        self.voice_btn.setToolTip(self._voice_button_hint)
+        self.voice_btn.setProperty("voiceState", state)
+        self.voice_btn.style().unpolish(self.voice_btn)
+        self.voice_btn.style().polish(self.voice_btn)
+        self.voice_btn.update()
+
+    def _on_voice_button_clicked(self):
+        """Use the mic button as a tap-to-record trigger."""
+        if self.voice_settings is None:
+            self.show_status_message("Voice settings are unavailable.")
+            return
+
+        if not getattr(self.voice_settings, "enabled", True):
+            self.show_status_message("Voice control is disabled in Settings.")
+            return
+
+        if not self.voice_service or not self.voice_service.is_available():
+            hint = self._voice_button_hint or "Voice control is unavailable."
+            self.show_status_message(hint)
+            return
+
+        if self.voice_service.is_recording():
+            self.voice_service.stop_recording()
+            self.show_status_message("Stopping voice recording...")
+            return
+
+        if not self.voice_service.start_button_capture():
+            if self.voice_service.last_recording_error():
+                return
+            self.show_status_message("Voice is busy. Please wait a moment and try again.")
+
+    def _find_message_for_sender(self, sender_name: str):
+        """Return the first visible message matching sender name or email."""
+        target = (sender_name or "").strip().lower()
+        if not target:
+            return None
+
+        for message in getattr(self, "_current_page_messages", []):
+            sender = (message.get("sender") or "").lower()
+            email = (message.get("email") or "").lower()
+            if target in sender or target in email:
+                return message
+        return None
+
+    def _find_any_message_for_sender(self, sender_name: str, preferred_channel: str = "any"):
+        """Find a sender match across loaded messages, preferring visible rows."""
+        visible_matches = self._matching_messages_for_sender(
+            sender_name,
+            preferred_channel,
+            getattr(self, "_current_page_messages", []),
+        )
+        if visible_matches:
+            return self._choose_voice_message_from_matches(visible_matches, sender_name)
+
+        all_matches = self._matching_messages_for_sender(
+            sender_name,
+            preferred_channel,
+            getattr(self, "messages", []),
+        )
+        if all_matches:
+            return self._choose_voice_message_from_matches(all_matches, sender_name)
+        return None
+
+    def _matching_messages_for_sender(self, sender_name: str, preferred_channel: str, messages: list) -> list:
+        target = (sender_name or "").strip().lower()
+        if not target:
+            return []
+
+        preferred = (preferred_channel or "any").strip().lower()
+        matches = []
+        seen_keys = set()
+        for message in messages or []:
+            if preferred in {"gmail", "slack"} and str(message.get("source", "")).lower() != preferred:
+                continue
+            sender = (message.get("sender") or "").lower()
+            email = (message.get("email") or "").lower()
+            channel = (message.get("channel_name") or "").lower()
+            if target in sender or target in email or target in channel:
+                key = self._message_key(message)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                matches.append(message)
+        return matches
+
+    def _choose_voice_message_from_matches(self, matches: list, sender_name: str):
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        choices = [self._format_voice_message_choice(message, index) for index, message in enumerate(matches, start=1)]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Voice Recipient",
+            f"Multiple messages match '{sender_name}'. Choose the one to use:",
+            choices,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            self._voice_resolution_cancelled = True
+            self.show_status_message("Voice command cancelled because recipient was ambiguous.")
+            self._log_voice_event(
+                "recipient_disambiguation_cancelled",
+                {"recipient": sender_name, "matches": len(matches)},
+            )
+            return None
+
+        selected_index = choices.index(choice)
+        selected = matches[selected_index]
+        self._log_voice_event(
+            "recipient_disambiguated",
+            {
+                "recipient": sender_name,
+                "selected": self._voice_message_log_payload(selected),
+                "matches": len(matches),
+            },
+        )
+        return selected
+
+    def _format_voice_message_choice(self, message: dict, index: int) -> str:
+        source = str(message.get("source", "") or "message").upper()
+        sender = message.get("sender") or message.get("email") or "Unknown"
+        subject = message.get("subject") or message.get("content_preview") or message.get("preview") or ""
+        subject = re.sub(r"\s+", " ", str(subject)).strip()
+        if len(subject) > 70:
+            subject = f"{subject[:67]}..."
+        return f"{index}. [{source}] {sender} - {subject}"
+
+    def _voice_message_log_payload(self, message: dict) -> dict:
+        return {
+            "source": message.get("source", ""),
+            "sender": message.get("sender", ""),
+            "email": message.get("email", ""),
+            "subject": message.get("subject", ""),
+            "id": message.get("id", ""),
+        }
+
+    def _find_slack_user_for_voice_recipient(self, recipient: str):
+        matches = self._matching_slack_users_for_voice_recipient(recipient)
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        choices = [self._format_voice_slack_user_choice(user, index) for index, user in enumerate(matches, start=1)]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Slack Recipient",
+            f"Multiple Slack users match '{recipient}'. Choose the recipient:",
+            choices,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            self._voice_resolution_cancelled = True
+            self.show_status_message("Voice command cancelled because Slack recipient was ambiguous.")
+            self._log_voice_event(
+                "slack_recipient_disambiguation_cancelled",
+                {"recipient": recipient, "matches": len(matches)},
+            )
+            return None
+        selected = matches[choices.index(choice)]
+        self._log_voice_event(
+            "slack_recipient_disambiguated",
+            {
+                "recipient": recipient,
+                "selected_user_id": selected.get("id", ""),
+                "selected_name": selected.get("real_name") or selected.get("name") or "",
+                "matches": len(matches),
+            },
+        )
+        return selected
+
+    def _matching_slack_users_for_voice_recipient(self, recipient: str) -> list:
+        target = (recipient or "").strip().lower()
+        if not target:
+            return []
+
+        matches = []
+        for user in getattr(self, "slack_users", []):
+            real_name = str(user.get("real_name", "")).lower()
+            username = str(user.get("name", "")).lower()
+            user_id = str(user.get("id", "")).lower()
+            if target in real_name or target in username or target == user_id:
+                matches.append(user)
+        return matches
+
+    def _format_voice_slack_user_choice(self, user: dict, index: int) -> str:
+        real_name = user.get("real_name") or user.get("name") or user.get("id", "Unknown")
+        username = user.get("name") or user.get("id", "")
+        return f"{index}. {real_name} (@{username})"
+
+    def _find_gmail_contact_for_voice_recipient(self, recipient: str):
+        target = (recipient or "").strip().lower()
+        if not target:
+            return None
+        if "@" in target:
+            return {"name": recipient.strip(), "email": target}
+
+        contacts = {}
+        for message in getattr(self, "messages", []):
+            if str(message.get("source", "")).lower() != "gmail":
+                continue
+            email = str(message.get("email", "") or "").strip().lower()
+            if not email:
+                continue
+            name = str(message.get("sender", "") or email).strip()
+            contacts[email] = {
+                "name": name,
+                "email": email,
+                "last_subject": message.get("subject", ""),
+            }
+
+        matches = [
+            contact for contact in contacts.values()
+            if target in contact["name"].lower() or target in contact["email"]
+        ]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        choices = [
+            f"{index}. {contact['name']} <{contact['email']}>"
+            for index, contact in enumerate(matches, start=1)
+        ]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Gmail Recipient",
+            f"Multiple Gmail contacts match '{recipient}'. Choose the recipient:",
+            choices,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            self._voice_resolution_cancelled = True
+            self.show_status_message("Voice command cancelled because Gmail recipient was ambiguous.")
+            self._log_voice_event(
+                "gmail_recipient_disambiguation_cancelled",
+                {"recipient": recipient, "matches": len(matches)},
+            )
+            return None
+        selected = matches[choices.index(choice)]
+        self._log_voice_event(
+            "gmail_recipient_disambiguated",
+            {
+                "recipient": recipient,
+                "selected_email": selected.get("email", ""),
+                "selected_name": selected.get("name", ""),
+                "matches": len(matches),
+            },
+        )
+        return selected
+
+    def _message_by_key(self, message_key: str):
+        if not message_key:
+            return None
+        for message in getattr(self, "messages", []):
+            if self._message_key(message) == message_key:
+                return message
+        return None
+
+    def _current_context_message(self):
+        """Return the message implied by 'this/current/selected' voice commands."""
+        if len(self.selected_message_keys) == 1:
+            selected = self._message_by_key(next(iter(self.selected_message_keys)))
+            if selected is not None:
+                return selected
+
+        if hasattr(self, "table") and self.table is not None:
+            row = self.table.currentRow()
+            if 0 <= row < len(getattr(self, "_current_page_messages", [])):
+                return self._current_page_messages[row]
+
+        last_message = self._message_by_key(self._last_context_message_key)
+        if last_message is not None:
+            return last_message
+
+        current_page = getattr(self, "_current_page_messages", [])
+        if current_page:
+            return current_page[0]
+        return None
+
+    def _remember_context_message(self, message: dict):
+        self._last_context_message_key = self._message_key(message) if message else None
+
+    def _voice_log_path(self) -> str:
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+        return os.path.join(project_root, "data", "voice_activity.jsonl")
+
+    def _log_voice_event(self, event_type: str, payload: dict = None):
+        """Append a compact voice activity record for audit/debugging."""
+        payload = payload or {}
+        event = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event_type,
+            **payload,
+        }
+        self.voice_command_history.append(event)
+        self.voice_command_history = self.voice_command_history[-50:]
+        try:
+            log_path = self._voice_log_path()
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"Voice activity log failed: {exc}")
+
+    def _voice_intent_payload(self, intent: VoiceIntent) -> dict:
+        try:
+            return intent.model_dump()
+        except AttributeError:
+            return intent.dict()
+
+    def _load_voice_history_events(self, limit: int = 200) -> list:
+        events = []
+        log_path = self._voice_log_path()
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            events.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as exc:
+            print(f"Voice history load failed: {exc}")
+
+        if self.voice_command_history:
+            known = {
+                (event.get("timestamp"), event.get("event"), event.get("text"))
+                for event in events
+            }
+            for event in self.voice_command_history:
+                key = (event.get("timestamp"), event.get("event"), event.get("text"))
+                if key not in known:
+                    events.append(event)
+        return events[-limit:]
+
+    def _voice_history_details(self, event: dict) -> str:
+        details = {
+            key: value
+            for key, value in event.items()
+            if key not in {"timestamp", "event", "text"}
+        }
+        if not details:
+            return ""
+        return json.dumps(details, ensure_ascii=False, default=str)
+
+    def show_voice_history_dialog(self):
+        """Show recent voice commands and voice automation events inside the app."""
+        events = list(reversed(self._load_voice_history_events(limit=200)))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Voice Command History")
+        dialog.resize(980, 520)
+
+        layout = QVBoxLayout(dialog)
+        title = QLabel("Voice Command History")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        table = QTableWidget(len(events), 4)
+        table.setHorizontalHeaderLabels(["Time", "Event", "Text", "Details"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+
+        for row, event in enumerate(events):
+            text = event.get("text", "")
+            if not text and isinstance(event.get("intent"), dict):
+                text = event["intent"].get("message", "")
+            values = [
+                event.get("timestamp", ""),
+                event.get("event", ""),
+                text,
+                self._voice_history_details(event),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                table.setItem(row, col, item)
+
+        layout.addWidget(table)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.exec()
+
+    def on_voice_command(self, text: str):
+        """Receive a transcribed voice command and dispatch it."""
+        command = VoiceCommandParser.parse(text)
+        if command.action == "noop":
+            return
+
+        self.show_status_message(f"Voice: {text}")
+        self._log_voice_event(
+            "transcription",
+            {
+                "text": text,
+                "legacy_action": command.action,
+                "legacy_action_type": command.action_type,
+            },
+        )
+
+        if self._should_try_natural_voice_intent(text, command) and self._try_execute_natural_voice_intent(text):
+            return
+
+        if command.action_type == "ui_action":
+            self._execute_ui_voice_action(command)
+            return
+
+        worker = AgentWorker(self.orchestrator.process_user_command(command.parameters["command"]))
+        worker.result_ready.connect(self.on_all_sync_complete)
+        worker.error_occurred.connect(self.on_agent_error)
+        worker.finished.connect(lambda: self._cleanup_worker(worker))
+        self.active_workers.append(worker)
+        worker.start()
+
+    def _should_try_natural_voice_intent(self, text: str, command: VoiceCommand) -> bool:
+        normalized = (text or "").lower()
+        if command.action_type != "ui_action":
+            return True
+        if command.action in {"reply_to_sender", "draft_for_sender"}:
+            return True
+        natural_markers = (
+            "send",
+            "reply",
+            "respond",
+            "draft",
+            "write",
+            "saying",
+            "with message",
+            "the reply is",
+        )
+        return any(marker in normalized for marker in natural_markers)
+
+    def _try_execute_natural_voice_intent(self, text: str) -> bool:
+        if not self.voice_intent_service:
+            return False
+
+        intents = self.voice_intent_service.parse_plan(text)
+        if not intents:
+            return False
+        self._log_voice_event(
+            "intent_plan_parsed",
+            {
+                "text": text,
+                "steps": [self._voice_intent_payload(intent) for intent in intents],
+            },
+        )
+
+        executable = [intent for intent in intents if intent.action != "unknown"]
+        if not executable:
+            self._log_voice_event(
+                "intent_rejected",
+                {
+                    "text": text,
+                    "reason": "unknown_intent",
+                },
+            )
+            return False
+
+        for index, intent in enumerate(executable, start=1):
+            if len(executable) > 1:
+                self.show_status_message(f"Voice step {index}/{len(executable)}: {intent.action.replace('_', ' ')}")
+            self._execute_natural_voice_intent(intent)
+        return True
+
+    def _execute_natural_voice_intent(self, intent: VoiceIntent):
+        action = intent.action
+        channel = intent.channel or "any"
+
+        if action == "filter_messages":
+            target = (intent.target or channel or "all").lower()
+            if target == "email":
+                target = "gmail"
+            if target in {"all", "gmail", "slack", "urgent"}:
+                self.apply_filter(target)
+            else:
+                self.show_status_message(f"Unsupported voice filter: {target}")
+            return
+
+        if action == "search_messages":
+            query = intent.query or intent.message or intent.recipient
+            if query and hasattr(self, "search_field"):
+                self.search_field.setText(query)
+            return
+
+        if action == "open_settings":
+            self.show_settings()
+            return
+        if action == "open_notifications":
+            self.show_notifications()
+            return
+        if action == "show_voice_history":
+            self.show_voice_history_dialog()
+            return
+        if action == "undo_last_send":
+            self._undo_last_supported_send()
+            return
+        if action == "next_page":
+            self.change_page(self.current_page + 1)
+            return
+        if action == "previous_page":
+            self.change_page(self.current_page - 1)
+            return
+        if action == "sync_gmail":
+            self.handle_gmail_sync(quiet=False)
+            return
+        if action == "sync_slack":
+            self._start_initial_slack_sync(limit=self.STARTUP_SLACK_INITIAL_FETCH_LIMIT)
+            return
+        if action == "sync_all":
+            self.sync_all_messages()
+            return
+
+        if action in {"reply_to_sender", "send_message", "draft_reply"}:
+            self._open_voice_message_composer(intent)
+            return
+
+        if action == "summarize_message":
+            self._summarize_voice_context(intent)
+            return
+
+        if action == "open_message":
+            message = self._message_for_voice_intent(intent)
+            if message is None:
+                self.show_status_message("No current message is available.")
+                return
+            self.show_full_message_dialog(message)
+            return
+
+        self.show_status_message("Voice command was understood but is not supported yet.")
+
+    def _open_voice_message_composer(self, intent: VoiceIntent):
+        message_text = (intent.message or "").strip()
+        preferred_channel = (intent.channel or "any").strip().lower()
+        self._voice_resolution_cancelled = False
+        message = self._message_for_voice_intent(intent)
+        if self._voice_resolution_cancelled:
+            return
+
+        if message is not None:
+            payload = dict(message)
+            if message_text:
+                payload["_prefill_draft_text"] = message_text
+            if self._can_send_voice_without_review(intent, message_text):
+                if self._send_voice_message_without_review(payload, message_text):
+                    return
+            if intent.action == "draft_reply" and not message_text:
+                self.smart_draft_message(payload)
+            else:
+                self.show_send_message_dialog(payload)
+            return
+
+        if preferred_channel in {"gmail", "email"}:
+            if self._open_voice_gmail_message(intent):
+                return
+
+        if preferred_channel in {"slack", "any"}:
+            if self._open_voice_slack_message(intent):
+                return
+
+        if preferred_channel == "any":
+            if self._open_voice_gmail_message(intent):
+                return
+
+        self.show_status_message(
+            f"No loaded message or Slack contact found for {intent.recipient or 'that recipient'}."
+        )
+
+    def _can_send_voice_without_review(self, intent: VoiceIntent, message_text: str) -> bool:
+        if not getattr(getattr(self, "voice_settings", None), "send_without_review", False):
+            return False
+        if intent.action not in {"reply_to_sender", "send_message"}:
+            return False
+        return bool((message_text or "").strip())
+
+    def _send_voice_message_without_review(self, message_data: dict, message_text: str) -> bool:
+        message_text = (message_text or "").strip()
+        if not message_text:
+            return False
+
+        source = str(message_data.get("source", "")).lower()
+        if source == "gmail":
+            return self._send_voice_gmail_reply_without_review(message_data, message_text)
+        if source == "slack":
+            return self._send_voice_slack_message_without_review(message_data, message_text)
+        return False
+
+    def _send_voice_gmail_reply_without_review(self, message_data: dict, message_text: str) -> bool:
+        if not self.gmail_service.is_connected:
+            QMessageBox.warning(
+                self,
+                "Gmail",
+                "Please connect to Gmail first.\n\nGo to Settings -> Integrations -> Gmail",
+            )
+            return True
+
+        recipient = message_data.get("sender") or message_data.get("email") or "the sender"
+        if not self._confirm_voice_direct_send("Gmail", recipient, message_text):
+            self._log_voice_event(
+                "direct_send_cancelled",
+                {
+                    "source": "gmail",
+                    "mode": "new_message" if message_data.get("_gmail_new_message") else "reply",
+                    "recipient": recipient,
+                    "message": message_text,
+                    "message_context": self._voice_message_log_payload(message_data),
+                },
+            )
+            return True
+
+        is_new_message = bool(message_data.get("_gmail_new_message"))
+        if is_new_message:
+            success, response_message = self.gmail_service.send_new_email(
+                message_data.get("email", ""),
+                message_data.get("subject", "Message from AutoReturn"),
+                message_text,
+                attachments=[],
+            )
+        else:
+            success, response_message = self.gmail_service.reply_to_message(
+                message_data,
+                message_text,
+                attachments=[],
+            )
+        if success:
+            action_label = "email" if is_new_message else "reply"
+            self.show_status_message(f"Voice {action_label} sent to {recipient}.")
+            QMessageBox.information(self, "Voice Message Sent", f"Message sent to {recipient}.")
+            self._log_voice_event(
+                "direct_send_sent",
+                {
+                    "source": "gmail",
+                    "mode": "new_message" if is_new_message else "reply",
+                    "recipient": recipient,
+                    "message": message_text,
+                    "message_context": self._voice_message_log_payload(message_data),
+                },
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Voice Reply Failed",
+                response_message or "Could not send the Gmail reply.",
+            )
+            self._log_voice_event(
+                "direct_send_failed",
+                {
+                    "source": "gmail",
+                    "mode": "new_message" if is_new_message else "reply",
+                    "recipient": recipient,
+                    "message": message_text,
+                    "error": response_message or "Could not send the Gmail reply.",
+                    "message_context": self._voice_message_log_payload(message_data),
+                },
+            )
+        return True
+
+    def _send_voice_slack_message_without_review(self, message_data: dict, message_text: str) -> bool:
+        if not self.slack_service.is_connected:
+            QMessageBox.warning(self, "Slack", "Please connect to Slack first.")
+            return True
+
+        target_user_id = self._slack_reply_target_user_id(message_data)
+        if not target_user_id:
+            QMessageBox.warning(self, "Slack", "Could not identify the Slack recipient.")
+            return True
+
+        recipient = message_data.get("sender") or message_data.get("email") or target_user_id
+        if not self._confirm_voice_direct_send("Slack", recipient, message_text):
+            self._log_voice_event(
+                "direct_send_cancelled",
+                {
+                    "source": "slack",
+                    "recipient": recipient,
+                    "user_id": target_user_id,
+                    "message": message_text,
+                    "message_context": self._voice_message_log_payload(message_data),
+                },
+            )
+            return True
+
+        success = bool(self.slack_service.send_dm_by_id(target_user_id, message_text, attachments=[]))
+        if success:
+            if self.slack_service.last_sent_message():
+                self.show_status_message(f"Voice message sent to {recipient}.")
+                self._log_voice_event(
+                    "direct_send_sent",
+                    {
+                        "source": "slack",
+                        "recipient": recipient,
+                        "user_id": target_user_id,
+                        "message": message_text,
+                        "message_context": self._voice_message_log_payload(message_data),
+                    },
+                )
+        else:
+            self._log_voice_event(
+                "direct_send_failed",
+                {
+                    "source": "slack",
+                    "recipient": recipient,
+                    "user_id": target_user_id,
+                    "message": message_text,
+                    "error": "Slack send failed.",
+                    "message_context": self._voice_message_log_payload(message_data),
+                },
+            )
+        return True
+
+    def _confirm_voice_direct_send(self, source: str, recipient: str, message_text: str) -> bool:
+        """Give direct-send users a short cancel window without opening the composer."""
+        seconds_left = self.VOICE_DIRECT_SEND_CANCEL_SECONDS
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("Voice Direct Send")
+        dialog.setText(f"Sending {source} message to {recipient}.")
+        dialog.setInformativeText(f"Message:\n{message_text}")
+        send_button = dialog.addButton(f"Send in {seconds_left}s", QMessageBox.AcceptRole)
+        cancel_button = dialog.addButton("Cancel", QMessageBox.RejectRole)
+        timer = QTimer(dialog)
+        timer.setInterval(1000)
+
+        def tick():
+            nonlocal seconds_left
+            seconds_left -= 1
+            if seconds_left <= 0:
+                timer.stop()
+                dialog.accept()
+                return
+            send_button.setText(f"Send in {seconds_left}s")
+
+        timer.timeout.connect(tick)
+        timer.start()
+        dialog.exec()
+        timer.stop()
+
+        cancelled = dialog.clickedButton() == cancel_button
+        if cancelled:
+            self.show_status_message("Voice direct send cancelled.")
+            return False
+        return True
+
+    def _slack_reply_target_user_id(self, message_data: dict) -> str:
+        user_id = str(message_data.get("user_id", "") or "").strip()
+        dm_user_id = str(message_data.get("dm_user_id", "") or "").strip()
+        my_user_id = str(getattr(self.slack_service, "my_user_id", "") or "").strip()
+
+        if user_id and user_id != my_user_id:
+            return user_id
+        if dm_user_id and dm_user_id != my_user_id:
+            return dm_user_id
+        return user_id or dm_user_id
+
+    def _message_for_voice_intent(self, intent: VoiceIntent):
+        target = (intent.target or "").strip().lower()
+        channel = (intent.channel or "any").strip().lower()
+        if intent.action == "send_message" and channel in {"gmail", "email"} and intent.recipient:
+            return None
+        if target in {"current", "this", "selected"} or not intent.recipient:
+            message = self._current_context_message()
+            if message is not None:
+                return message
+            if not intent.recipient:
+                return None
+        return self._find_any_message_for_sender(intent.recipient, channel or "any")
+
+    def _summarize_voice_context(self, intent: VoiceIntent):
+        message = self._message_for_voice_intent(intent)
+        if message is None:
+            self.show_status_message("No current message is available to summarize.")
+            return
+        if self._summary_for_table(message):
+            self.show_full_summary_dialog(message)
+            return
+        self.generate_summaries_for_messages([message])
+        self.show_status_message("Generating summary for current message...")
+
+    def _open_voice_gmail_message(self, intent: VoiceIntent) -> bool:
+        contact = self._find_gmail_contact_for_voice_recipient(intent.recipient)
+        if contact is None:
+            if self._voice_resolution_cancelled:
+                return True
+            return False
+        if not self.gmail_service.is_connected:
+            QMessageBox.warning(
+                self,
+                "Gmail",
+                "Please connect to Gmail first.\n\nGo to Settings -> Integrations -> Gmail",
+            )
+            return True
+
+        payload = {
+            "source": "gmail",
+            "sender": contact.get("name") or contact.get("email") or intent.recipient,
+            "email": contact.get("email", ""),
+            "subject": "Message from AutoReturn",
+            "_gmail_new_message": True,
+            "_prefill_draft_text": intent.message or "",
+        }
+        if self._can_send_voice_without_review(intent, intent.message or ""):
+            return self._send_voice_message_without_review(payload, intent.message or "")
+        self.show_send_message_dialog(payload)
+        return True
+
+    def _open_voice_slack_message(self, intent: VoiceIntent) -> bool:
+        user = self._find_slack_user_for_voice_recipient(intent.recipient)
+        if user is None:
+            if self._voice_resolution_cancelled:
+                return True
+            return False
+        if not self.slack_service.is_connected:
+            QMessageBox.warning(self, "Slack", "Please connect to Slack first.")
+            return True
+        if not self.slack_users:
+            QMessageBox.warning(self, "Slack", "Slack users are still loading. Please wait.")
+            return True
+
+        payload = {
+            "source": "slack",
+            "sender": user.get("real_name") or user.get("name") or intent.recipient,
+            "user_id": user.get("id", ""),
+            "dm_user_id": user.get("id", ""),
+            "is_dm": True,
+            "_prefill_draft_text": intent.message or "",
+        }
+        if self._can_send_voice_without_review(intent, intent.message or ""):
+            return self._send_voice_message_without_review(payload, intent.message or "")
+        self.show_send_message_dialog(payload)
+        return True
+
+    def _execute_ui_voice_action(self, cmd: VoiceCommand):
+        """Execute UI-local voice commands without using the orchestrator."""
+        action = cmd.action
+        params = cmd.parameters
+
+        if action == "filter":
+            self.apply_filter(params["filter_id"])
+        elif action == "search":
+            if hasattr(self, "search_field"):
+                self.search_field.setText(params["query"])
+        elif action == "open_settings":
+            self.show_settings()
+        elif action == "show_notifications":
+            self.show_notifications()
+        elif action == "next_page":
+            self.change_page(self.current_page + 1)
+        elif action == "prev_page":
+            self.change_page(self.current_page - 1)
+        elif action == "generate_summaries":
+            self.generate_all_summaries()
+        elif action == "reply_to_sender":
+            message = self._find_message_for_sender(params.get("sender_name", ""))
+            if message is None:
+                self.show_status_message(f"No visible message found for {params.get('sender_name', 'that sender')}.")
+                return
+            self.show_send_message_dialog(message)
+        elif action == "open_message_by_index":
+            index = params.get("index", -1)
+            if 0 <= index < len(getattr(self, "_current_page_messages", [])):
+                self.show_full_message_dialog(self._current_page_messages[index])
+            else:
+                self.show_status_message(f"No message at position {index + 1}.")
+        elif action == "draft_for_sender":
+            message = self._find_message_for_sender(params.get("sender_name", ""))
+            if message is None:
+                self.show_status_message(f"No visible message found for {params.get('sender_name', 'that sender')}.")
+                return
+            self.smart_draft_message(message)
+
     # -------------------------
     # UI SETUP
     # -------------------------
@@ -2067,8 +3317,20 @@ class AutoReturnApp(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         
-        voice_btn = QPushButton("Voice")
-        voice_btn.setObjectName("btnVoice")
+        self.voice_btn = QPushButton("Mic")
+        self.voice_btn.setObjectName("btnVoice")
+        self.voice_btn.setProperty("voiceState", "disabled")
+        self.voice_btn.setFixedHeight(40)
+        self.voice_btn.setMinimumWidth(72)
+        self.voice_btn.clicked.connect(self._on_voice_button_clicked)
+        self.voice_btn.setToolTip(self._voice_button_hint)
+
+        voice_history_btn = QPushButton("Voice Log")
+        voice_history_btn.setObjectName("btnSecondary")
+        voice_history_btn.setFixedHeight(40)
+        voice_history_btn.setMinimumWidth(92)
+        voice_history_btn.setToolTip("Show recent voice commands and actions")
+        voice_history_btn.clicked.connect(self.show_voice_history_dialog)
         
         notif_btn = QPushButton("🔔")
         notif_btn.setObjectName("iconBtn")
@@ -2092,7 +3354,8 @@ class AutoReturnApp(QMainWindow):
         layout.addWidget(spacer)
         layout.addWidget(self.search_field)
         layout.addWidget(spacer)
-        layout.addWidget(voice_btn)
+        layout.addWidget(self.voice_btn)
+        layout.addWidget(voice_history_btn)
         layout.addWidget(notif_btn)
         layout.addWidget(self.user_name_label)
         layout.addWidget(settings_btn)
@@ -2623,6 +3886,60 @@ class AutoReturnApp(QMainWindow):
             ]
         )
 
+    def _analysis_cache_for_source(self, source: str) -> dict:
+        """Return cached AI/rule analysis for messages already loaded in the UI."""
+        return build_message_analysis_cache(getattr(self, "messages", []), source=source)
+
+    def _analysis_cache_by_source(self) -> dict:
+        """Return source-scoped analysis caches for orchestrator sync requests."""
+        return {
+            "gmail": self._analysis_cache_for_source("gmail"),
+            "slack": self._analysis_cache_for_source("slack"),
+        }
+
+    def _merge_analysis_fields(self, target: dict, incoming: dict) -> bool:
+        """Copy useful computed fields from an incoming duplicate message."""
+        changed = False
+        incoming_has_full_priority = bool(str(incoming.get("ai_priority_score", "") or "").strip())
+
+        for field in ANALYSIS_CACHE_FIELDS:
+            if field not in incoming:
+                continue
+
+            value = incoming.get(field)
+            if field == "ai_events":
+                if "ai_events" not in target and isinstance(value, list):
+                    target[field] = value
+                    changed = True
+                continue
+
+            if field == "ai_events_count":
+                if "ai_events_count" not in target and isinstance(value, int):
+                    target[field] = value
+                    changed = True
+                continue
+
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, tuple, set, dict)) and not value:
+                continue
+
+            if field == "priority" and not incoming_has_full_priority:
+                continue
+            if field == "priority":
+                if not str(target.get("ai_priority_score", "") or "").strip():
+                    target[field] = value
+                    changed = True
+                continue
+
+            if not target.get(field):
+                target[field] = value
+                changed = True
+
+        return changed
+
     # -------------------------
     # SUMMARY FOR TABLE
     # Handles summary functionality for for table.
@@ -2960,6 +4277,7 @@ class AutoReturnApp(QMainWindow):
             return
 
         msg = self._current_page_messages[row]
+        self._remember_context_message(msg)
 
         # Checkbox and action columns are interactive controls.
         if column in (0, 7):
@@ -3836,6 +5154,128 @@ class AutoReturnApp(QMainWindow):
         label.update()
 
     # -------------------------
+    # VOICE UI STATE
+    # -------------------------
+    def _on_voice_listening_started(self):
+        """Reflect that the microphone is actively recording."""
+        source = self.voice_service.current_activation_source() if self.voice_service else ""
+        hotkey = getattr(self.voice_settings, "hotkey", "ctrl+shift+v").upper()
+        if source == "hotkey":
+            hint = f"Listening... release {hotkey} when you're done speaking."
+        elif source == "button":
+            hint = "Listening... click Mic again or pause after speaking."
+        elif source == "wake-word":
+            hint = "Wake word heard. Speak your command and pause when done."
+        else:
+            hint = self.voice_service.usage_hint() if self.voice_service else f"Listening... release {hotkey} when you're done speaking."
+        self._update_voice_button_state(
+            "listening",
+            hint,
+        )
+        self.show_status_message("Listening for a voice command...")
+
+    def _on_voice_listening_stopped(self):
+        """Reflect that the recording phase has ended."""
+        if self.voice_service and self.voice_service.is_prepared():
+            message = "Transcribing voice command..."
+        else:
+            message = "Preparing voice model and transcribing command..."
+        self._update_voice_button_state("processing", message)
+        self.show_status_message(message)
+
+    def _on_voice_transcription_done(self):
+        """Restore the idle voice state after transcription completes."""
+        if not getattr(self.voice_settings, "enabled", False):
+            self._update_voice_button_state(
+                "disabled",
+                "Voice control is disabled in Settings. Enable it to use Mic.",
+            )
+            return
+
+        if self.voice_service and self.voice_service.is_available():
+            self._update_voice_button_state(
+                "idle",
+                self.voice_service.usage_hint(),
+            )
+        else:
+            hint = self._voice_button_hint or "Voice control is unavailable on this machine."
+            self._update_voice_button_state("disabled", hint)
+
+    def _on_voice_error(self, error: str):
+        """Surface voice errors without interrupting the rest of the app."""
+        self.show_status_message(f"Voice error: {error}")
+        if self._is_microphone_permission_error(error):
+            self._update_voice_button_state(
+                "idle",
+                "Microphone access is blocked. Allow it in macOS Privacy settings, then try Mic again.",
+            )
+            self._show_microphone_permission_dialog(error)
+            return
+        if not self.voice_service or not self.voice_service.is_available():
+            hint = self.voice_service.startup_error() if self.voice_service else error
+            self._update_voice_button_state("disabled", hint or error)
+            return
+        self._update_voice_button_state("idle", self.voice_service.usage_hint())
+
+    def _is_microphone_permission_error(self, error: str) -> bool:
+        text = (error or "").lower()
+        permission_markers = (
+            "microphone access is unavailable",
+            "microphone permission",
+            "privacy > microphone",
+            "not authorized",
+            "not authorised",
+            "inputstream",
+            "input device",
+            "unanticipated host error",
+        )
+        return any(marker in text for marker in permission_markers)
+
+    def _show_microphone_permission_dialog(self, error: str):
+        if self._voice_permission_dialog_visible:
+            return
+
+        self._voice_permission_dialog_visible = True
+        try:
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Warning)
+            dialog.setWindowTitle("Microphone Permission Required")
+            dialog.setText("AutoReturn cannot access the microphone.")
+            dialog.setInformativeText(
+                "Allow microphone access for Visual Studio Code in macOS "
+                "System Preferences > Security & Privacy > Privacy > Microphone.\n\n"
+                "If you launched AutoReturn from Terminal or Python instead of VS Code, "
+                "allow that app too, then try Mic again."
+            )
+            dialog.setDetailedText(error or "")
+            open_button = dialog.addButton("Open Microphone Settings", QMessageBox.AcceptRole)
+            dialog.addButton(QMessageBox.Cancel)
+            dialog.exec()
+
+            if dialog.clickedButton() == open_button:
+                if self._open_macos_microphone_settings():
+                    self.show_status_message("Opened macOS Microphone privacy settings.")
+                else:
+                    self.show_status_message(
+                        "Open System Preferences > Security & Privacy > Privacy > Microphone."
+                    )
+        finally:
+            self._voice_permission_dialog_visible = False
+
+    def _open_macos_microphone_settings(self) -> bool:
+        if sys.platform != "darwin":
+            return False
+
+        urls = (
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "x-apple.systempreferences:com.apple.preference.security",
+        )
+        for url in urls:
+            if QDesktopServices.openUrl(QUrl(url)):
+                return True
+        return False
+
+    # -------------------------
     # SHOW STATUS MESSAGE
     # Displays the UI for status message.
     # -------------------------
@@ -3854,7 +5294,7 @@ class AutoReturnApp(QMainWindow):
     # Handles notify functionality for desktop.
     # -------------------------
     def _notify_desktop(self, title: str, message: str):
-        """Send a desktop notification if supported (plyer)."""
+        """Send a desktop notification if supported by the current OS."""
         try:
             dnd_enabled, _ = self._get_automation_status_snapshot()
             if dnd_enabled:
@@ -3863,11 +5303,7 @@ class AutoReturnApp(QMainWindow):
             # If settings cannot be read, keep existing behavior.
             pass
 
-        try:
-            from plyer import notification
-            notification.notify(title=title, message=message, timeout=6)
-        except Exception as exc:
-            print(f"Notification error: {exc}")
+        notify_desktop(title, message, timeout=6)
 
     # -------------------------
     # SCHEDULE TABLE REFRESH
@@ -4115,6 +5551,7 @@ class AutoReturnApp(QMainWindow):
         dialog.sync_gmail_callback = lambda: self.handle_gmail_sync(quiet=False)
         dialog.get_gmail_status_callback = self.gmail_service.get_status_snapshot
         dialog.profile_updated.connect(self.on_profile_updated)
+        dialog.automation_settings_updated.connect(self.on_automation_settings_updated)
         dialog.refresh_gmail_status()
         dialog.exec()
         self.update_status_bar()
@@ -4132,6 +5569,112 @@ class AutoReturnApp(QMainWindow):
         self.user_data = updated_user
         if hasattr(self, 'user_name_label'):
             self.user_name_label.setText(self.user_data.get('name', 'User'))
+
+    # -------------------------
+    # USER STORAGE KEY
+    # Returns a stable per-user key for local integration storage.
+    # -------------------------
+    def _current_user_storage_key(self) -> str:
+        if self.user_data:
+            user_id = (self.user_data.get("user_id") or "").strip()
+            if user_id:
+                return user_id
+            email = (self.user_data.get("email") or "").strip().lower()
+            if email:
+                return re.sub(r"[^a-z0-9._-]+", "_", email)
+        return ""
+
+    # -------------------------
+    # SLACK KEYRING KEY
+    # Returns the per-user keyring slot for Slack token persistence.
+    # -------------------------
+    def _slack_keyring_key(self) -> str:
+        storage_key = self._current_user_storage_key() or "global"
+        return f"{storage_key}:slack_token"
+
+    # -------------------------
+    # LOAD CONNECTED ACCOUNTS
+    # Fetches integration mapping rows for the current authenticated user.
+    # -------------------------
+    def _load_connected_accounts_for_user(self) -> dict:
+        user_id = (self.user_data or {}).get("user_id", "")
+        if not user_id or not self.supabase_auth_service.is_configured():
+            return {}
+        try:
+            rows = self.supabase_auth_service.get_connected_accounts(user_id)
+        except Exception as exc:
+            print(f"Could not load connected accounts: {exc}")
+            return {}
+        return {row.get("provider"): row for row in rows if row.get("provider")}
+
+    # -------------------------
+    # PROVIDER ENABLED CHECK
+    # Returns whether the current user has this provider mapped as connected.
+    # -------------------------
+    def _is_provider_enabled_for_current_user(self, provider: str) -> bool:
+        if not self.user_data:
+            return False
+        user_id = (self.user_data.get("user_id") or "").strip()
+        if not user_id:
+            return True
+        row = self.connected_accounts_map.get(provider)
+        return bool(row and row.get("connected"))
+
+    # -------------------------
+    # SAVE CONNECTED ACCOUNT STATE
+    # Upserts provider ownership state for the current authenticated user.
+    # -------------------------
+    def _save_connected_account_state(
+        self,
+        provider: str,
+        provider_account_id: str = "",
+        provider_account_email: str = "",
+        provider_display_name: str = "",
+    ):
+        if not self.user_data:
+            return
+        user_id = (self.user_data.get("user_id") or "").strip()
+        if not user_id:
+            return
+        try:
+            self.supabase_auth_service.upsert_connected_account(
+                user_id=user_id,
+                provider=provider,
+                provider_account_id=provider_account_id,
+                provider_account_email=provider_account_email,
+                provider_display_name=provider_display_name,
+                connected=True,
+            )
+            self.connected_accounts_map[provider] = {
+                "provider": provider,
+                "connected": True,
+                "provider_account_id": provider_account_id,
+                "provider_account_email": provider_account_email,
+                "provider_display_name": provider_display_name,
+            }
+            self.user_data.setdefault("connected_accounts", {})[provider] = True
+        except Exception as exc:
+            print(f"Could not save connected account state for {provider}: {exc}")
+
+    # -------------------------
+    # MARK CONNECTED ACCOUNT DISCONNECTED
+    # Updates Supabase mapping state when a provider is disconnected locally.
+    # -------------------------
+    def _mark_connected_account_disconnected(self, provider: str):
+        if not self.user_data:
+            return
+        user_id = (self.user_data.get("user_id") or "").strip()
+        if not user_id:
+            return
+        try:
+            self.supabase_auth_service.disconnect_connected_account(user_id, provider)
+            self.connected_accounts_map[provider] = {
+                **self.connected_accounts_map.get(provider, {"provider": provider}),
+                "connected": False,
+            }
+            self.user_data.setdefault("connected_accounts", {})[provider] = False
+        except Exception as exc:
+            print(f"Could not mark {provider} disconnected: {exc}")
     
     # -------------------------
     # WINDOW EVENTS
@@ -4172,6 +5715,9 @@ class AutoReturnApp(QMainWindow):
         # Disconnect services
         if self.slack_service.is_connected:
             self.slack_service.disconnect()
+
+        if self.voice_service is not None:
+            self.voice_service.stop()
         
         event.accept()
         print("Shutdown complete")
