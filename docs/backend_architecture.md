@@ -36,7 +36,7 @@ graph TD
         GmailService[GmailIntegrationService]:::service
         SlackService[SlackBackendService]:::service
         OllamaService[OllamaService (API)]:::ai
-        LocalLLM[Local LLM (kimi-k2.5)]:::ai
+        LocalLLM[Local LLM (kimi-k2.6)]:::ai
     end
 
     %% Flow: User Request

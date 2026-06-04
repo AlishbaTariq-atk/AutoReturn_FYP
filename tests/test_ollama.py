@@ -29,7 +29,7 @@ from src.backend.services.ai_service import OllamaService
 def test_ollama():
     print("Testing Ollama connection...")
     
-    ollama = OllamaService(model_name="qwen2.5:1.5b")
+    ollama = OllamaService()
     
     # Test connection
     if not ollama.check_connection():

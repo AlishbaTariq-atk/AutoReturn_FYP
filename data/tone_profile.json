@@ -1,5 +1,5 @@
 {
-  "default_tone": "informal",
+  "default_tone": "formal",
   "sender_preferences": {
     "p229123": "informal",
     "22P9112 Alishba Tariq": "informal"
@@ -7,7 +7,7 @@
   "domain_preferences": {
     "unknown": "informal"
   },
-  "auto_tone_enabled": false,
+  "auto_tone_enabled": true,
   "manual_override_history": [
     {
       "timestamp": "2026-03-10T16:05:45.557209",
